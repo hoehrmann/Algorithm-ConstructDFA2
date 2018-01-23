@@ -1,0 +1,10 @@
+eg/example.pl
+MANIFEST
+t/03rand.t
+t/99podcov.t
+t/98podsyn.t
+t/01basic.t
+lib/Algorithm/ConstructDFA2.pm
+README
+Changes
+Makefile.PL
