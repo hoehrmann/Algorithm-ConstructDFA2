@@ -20,6 +20,7 @@ WriteMakefile(
     'List::Util'      => 0,
     'List::MoreUtils' => 0,
     'Graph::Directed' => 0,
+    'Graph::Feather'  => 0,
     'YAML::XS'        => 0,
   },
   ($] >= 5.005 ?     
