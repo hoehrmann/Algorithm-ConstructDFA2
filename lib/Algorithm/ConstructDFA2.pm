@@ -10,7 +10,7 @@ use Memoize;
 use Log::Any qw//;
 use DBI;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 has 'input_alphabet' => (
   is       => 'ro',

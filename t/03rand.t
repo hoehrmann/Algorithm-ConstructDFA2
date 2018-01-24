@@ -16,30 +16,6 @@ my $max_vertices = 8;
 my $nullable_odds = 0.3;
 my $matches_odds = 1 / @alphabet;
 
-sub stack_by(&@) {
-  my $code = shift;
-  my @result;
-  my $prev_key;
-
-  for (@_) {
-    my $cur_key = $code->( $_ );
-
-    if (not(ref $prev_key)
-     or not(defined $cur_key)
-     or not(defined $$prev_key)
-     or not($cur_key eq $$prev_key)) {
-
-      push @result, [];
-    }
-
-    push @{ $result[-1] }, $_;
-    
-    $prev_key = \$cur_key;
-  }
-
-  return @result;
-}
-
 sub get_dfa {
   my ($g, $start, $final, $nullable, $matches) = @_;
 
