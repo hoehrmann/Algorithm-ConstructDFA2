@@ -798,24 +798,24 @@ default.
 
 =over
 
-=item $self->find_or_create_state_id(@vertices)
+=item $dfa->find_or_create_state_id(@vertices)
 
 Given a list of vertices, computes a new state, adds it to the
 automaton if it does not already exist, and returns an identifier
 for the state. This is used to create a start state in the DFA.
 
-=item $self->compute_some_transitions($limit)
+=item $dfa->compute_some_transitions($limit)
 
 Computes up to C<$limit> additional transitions and returns the
 number of transitions actually computed. A return value of zero
 indicates that all transitions have been computed.
 
-=item $self->dead_state_id()
+=item $dfa->dead_state_id()
 
 Returns the state identifier for a fixed dead state (from which
 no accepting configuration can be reached).
 
-=item $self->cleanup_dead_states(\&vertices_accept)
+=item $dfa->cleanup_dead_states(\&vertices_accept)
 
 Given a code reference that takes a list of vertices and returns
 true if and only if the vertices are an accepting configuration,
