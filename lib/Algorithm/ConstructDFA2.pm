@@ -4,13 +4,13 @@ use warnings;
 use 5.024000;
 use Types::Standard qw/:all/;
 use List::UtilsBy qw/sort_by nsort_by partition_by/;
-use List::Util qw/uniq/;
+use List::MoreUtils qw/uniq/;
 use Moo;
 use Memoize;
 use Log::Any qw//;
 use DBI;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 has 'input_alphabet' => (
   is       => 'ro',
@@ -896,6 +896,10 @@ L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Algorithm-ConstructDFA2>
 =item * L<Algorithm::ConstructDFA::XS> - obsolete predecessor
 
 =back
+
+=head1 ACKNOWLEDGEMENTS
+
+Thanks to Slaven Rezic for bug reports.
 
 =head1 AUTHOR / COPYRIGHT / LICENSE
 
