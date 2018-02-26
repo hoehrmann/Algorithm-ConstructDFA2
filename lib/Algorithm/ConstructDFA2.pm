@@ -373,9 +373,20 @@ sub _deploy_schema {
         INNER JOIN Edge e
           ON (e.src = c1.vertex AND e.dst = c2.vertex)
         INNER JOIN Match m
-          ON (m.input = tr.input AND m.vertex = c1.vertex)
+          ON (m.input = tr.input AND m.vertex = c1.vertex);
     
-
+    CREATE VIEW view_transitions_as_configuration_pair AS
+    SELECT
+      c1.rowid AS src_id,
+      c2.rowid AS dst_id
+    FROM
+      view_transitions_as_5tuples t
+        INNER JOIN Configuration c1
+          ON (c1.state = t.src_state
+            AND c1.vertex = t.src_vertex)
+        INNER JOIN Configuration c2
+          ON (c2.state = t.dst_state
+            AND c2.vertex = t.dst_vertex);
   });
 }
 
