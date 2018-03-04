@@ -272,24 +272,35 @@ sub _deploy_schema {
     -- DFA State Composition
     -----------------------------------------------------------------
 
-    CREATE TABLE Configuration (
-      state INTEGER NOT NULL,
-      vertex INTEGER NOT NULL,
-      UNIQUE(state, vertex),
-      FOREIGN KEY (state)
-        REFERENCES State(state_id)
-        ON DELETE CASCADE
-        ON UPDATE NO ACTION,
-      FOREIGN KEY (vertex)
-        REFERENCES Vertex(value)
-        ON DELETE NO ACTION
-        ON UPDATE NO ACTION
-    );
+    CREATE VIEW Configuration AS
+    SELECT
+      State.state_id AS state,
+      each.value AS vertex
+    FROM
+      State
+        INNER JOIN json_each(State.vertex_str) each;
 
-    CREATE INDEX Configuration_idx_vertex ON Configuration (vertex);
-
-    -- can use covering index instead
-    -- CREATE INDEX Configuration_idx_state ON Configuration (state);
+    CREATE TRIGGER
+      trigger_Configuration_delete
+    INSTEAD OF DELETE ON
+      Configuration
+    FOR EACH ROW BEGIN
+      UPDATE
+        State
+      SET
+        vertex_str = _canonical((
+          SELECT
+            json_group_array(c.vertex)
+          FROM
+            Configuration c
+          WHERE
+            c.vertex <> OLD.vertex
+          GROUP BY
+            c.state
+        ))
+      WHERE
+        State.state_id = OLD.state;
+    END;
 
     -----------------------------------------------------------------
     -- Input Graph Vertex Match data
@@ -515,24 +526,7 @@ sub _find_or_create_state_from_vertex_str {
 
   $state_id = $self->_dbh->sqlite_last_insert_rowid();
 
-  # NOTE: This would fail if one of the vertices does not exist
-  # in the database yet, probably due to find_or_create_state_id
-  # with vertices not passed in the constructor. It is not clear
-  # whether that is a good thing to catch errors, or a usability
-  # problem. Adding a trigger to Configuration or inserting the
-  # vertices here is probably a performance problem though, so
-  # adding vertices should be done by find_or_create_state_id if
-  # at all.
-
-  my $sth2 = $self->_dbh->prepare(q{
-    INSERT INTO Configuration(state, vertex) VALUES (?, ?)
-  });
-
-  $sth2->execute($state_id, $_)
-    for $self->_vertex_str_to_vertices($vertex_str);
-
   $self->_dbh->commit();
-
   return $state_id;
 }
 
