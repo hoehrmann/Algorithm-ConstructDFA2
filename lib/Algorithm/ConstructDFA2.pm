@@ -535,15 +535,11 @@ sub _vertex_str_from_partial_list {
 
   return $self->_vertex_str_from_vertices() unless @vertices;
 
-  my $escaped_roots = join ", ", map {
-    $self->_dbh->quote($_)
-  } @vertices;
-
   my ($vertex_str) = $self->_dbh->selectrow_array(qq{
     SELECT _canonical(json_group_array(closure.e_reachable))
     FROM Closure
-    WHERE root IN ($escaped_roots)
-  });
+    WHERE root IN (SELECT value FROM json_each(?))
+  }, {}, $self->_json->encode(\@vertices));
 
   return $vertex_str;
 }
@@ -562,6 +558,83 @@ sub vertices_in_state {
   return map { @$_ } $self->_dbh->selectall_array(q{
     SELECT vertex FROM Configuration WHERE state = ?
   }, {}, $state_id);
+}
+
+sub compute_some_transitions {
+  my ($self, $limit) = @_;
+
+  $limit //= 1_000;
+
+  my $dbh = $self->_dbh;
+  local $dbh->{sqlite_allow_multiple_statements} = 1;
+
+  my ($old_max) = $dbh->selectrow_array(q{
+    SELECT COALESCE(MAX(rowid), 0) FROM Transition
+  });
+
+  $dbh->do(q{
+    DROP TABLE IF EXISTS tmp_transition;
+    CREATE TABLE tmp_transition AS
+    SELECT
+        s.state_id AS src 
+      , i.value AS input
+      , '[]' AS dst_vertex_str
+    FROM 
+      state s 
+      CROSS JOIN input i
+      LEFT JOIN transition t
+        ON (t.src = s.state_id AND t.input = i.value)
+    WHERE
+      t.dst IS NULL
+    LIMIT ?;
+
+    CREATE UNIQUE INDEX
+      idx_tmp_transition
+    ON tmp_transition(src, input);
+
+    INSERT OR REPLACE INTO
+      tmp_transition(src, input, dst_vertex_str)
+    SELECT
+      n.src,
+      n.input,
+      _canonical(json_group_array(closure.e_reachable))
+        AS dst_vertex_str
+    FROM
+      tmp_transition n
+        INNER JOIN configuration c
+          ON (n.src = c.state)
+        INNER JOIN edge
+          ON (c.vertex = edge.src)
+        INNER JOIN closure
+          ON (edge.dst = closure.root)
+        INNER JOIN match m
+          ON (m.vertex = c.vertex)
+    WHERE
+      m.input = n.input
+    GROUP BY
+      n.src,
+      n.input;
+
+    INSERT OR IGNORE INTO State(vertex_str)
+    SELECT DISTINCT dst_vertex_str
+    FROM tmp_transition;
+
+    INSERT INTO Transition(src, input, dst)
+    SELECT src, input, s.state_id
+    FROM tmp_transition n
+      INNER JOIN State s
+        ON (s.vertex_str = n.dst_vertex_str);
+
+    ANALYZE State;
+    ANALYZE Transition;
+
+  }, {}, $limit);
+
+  my ($new_max) = $dbh->selectrow_array(q{
+    SELECT COALESCE(MAX(rowid), 0) FROM Transition
+  });
+  
+  return $new_max - $old_max;
 }
 
 sub cleanup_dead_states {
@@ -615,66 +688,6 @@ sub cleanup_dead_states {
   $self->_dbh->sqlite_create_function( '_vertices_accept', 1, undef );
 
   return @accepting;
-}
-
-sub compute_some_transitions {
-  my ($self, $limit) = @_;
-
-  $limit //= 1_000;
-
-  my $sth = $self->_dbh->prepare_cached(q{
-    SELECT
-        s.state_id AS src 
-      , i.value AS input
-      , _canonical(json_group_array(closure.e_reachable))
-          AS dst_vertex_str
-    FROM 
-      state s 
-      CROSS JOIN input i
-      LEFT JOIN configuration c
-        ON (s.state_id = c.state)
-      LEFT JOIN match m
-        ON (m.vertex = c.vertex AND m.input = i.value)
-      LEFT JOIN edge
-        ON (m.vertex = edge.src)
-      LEFT JOIN closure
-        ON (edge.dst = closure.root)
-      LEFT JOIN transition t
-        ON (t.src = s.state_id AND t.input = i.value)
-    WHERE
-      t.dst IS NULL
-    GROUP BY
-      s.state_id, i.rowid
-    ORDER BY
-      s.state_id, i.rowid
-    LIMIT ?
-  });
-
-  my @new = $self->_dbh->selectall_array($sth, {}, $limit);
-
-  my $find_or_create = memoize(sub {
-    _find_or_create_state_from_vertex_str($self, @_);
-  });
-
-  my $sth2 = $self->_dbh->prepare(q{
-    INSERT INTO Transition(src, input, dst) VALUES (?, ?, ?)
-  });
-
-  my @transitions;
-
-  for my $t (@new) {
-    push @transitions, [(
-      $t->[0],
-      $t->[1],
-      $find_or_create->($t->[2]),
-    )];
-  }
-
-  $self->_dbh->begin_work();
-  $sth2->execute(@$_) for @transitions;
-  $self->_dbh->commit();
-
-  return scalar @new;
 }
 
 sub transitions_as_3tuples {
