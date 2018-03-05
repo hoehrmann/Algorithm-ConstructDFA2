@@ -280,28 +280,6 @@ sub _deploy_schema {
       State
         INNER JOIN json_each(State.vertex_str) each;
 
-    CREATE TRIGGER
-      trigger_Configuration_delete
-    INSTEAD OF DELETE ON
-      Configuration
-    FOR EACH ROW BEGIN
-      UPDATE
-        State
-      SET
-        vertex_str = _canonical((
-          SELECT
-            json_group_array(c.vertex)
-          FROM
-            Configuration c
-          WHERE
-            c.vertex <> OLD.vertex
-          GROUP BY
-            c.state
-        ))
-      WHERE
-        State.state_id = OLD.state;
-    END;
-
     -----------------------------------------------------------------
     -- Input Graph Vertex Match data
     -----------------------------------------------------------------
@@ -489,7 +467,7 @@ sub _vertex_str_from_vertices {
   my ($self, @vertices) = @_;
 
   return $self->_json->encode([
-    nsort_by { $_ } uniq(grep { defined } @vertices)
+    sort { $a <=> $b } uniq(grep { defined } @vertices)
   ]);
 }
 
