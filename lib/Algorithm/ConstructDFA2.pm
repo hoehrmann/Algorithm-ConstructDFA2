@@ -146,9 +146,6 @@ sub BUILD {
   ###################################################################
   # Let DB analyze data so far
 
-  $self->_log->debug("Updating DB statistics");
-  $self->_dbh->do('ANALYZE');
-
   # FIXME: strictly speaking, the dead state is a ombination of all
   # vertices from which an accepting combination of vertices cannot
   # be reached. That might be important. Perhaps when later merging
@@ -156,6 +153,14 @@ sub BUILD {
 
   my $dead_state_id = $self->find_or_create_state_id();
   $self->_set_dead_state_id($dead_state_id);
+
+  # NOTE: This used to call `ANALYZE` before creating the dead state.
+  # That resulted in very poor performance computing the first set of
+  # transitions. Doing it after the dead state is created results in
+  # order-of-magnitude performance improvement for some inputs.
+
+  $self->_log->debug("Updating DB statistics");
+  $self->_dbh->do('ANALYZE');
 }
 
 sub _deploy_schema {
@@ -374,7 +379,9 @@ sub _deploy_schema {
           ON (e.src = c1.vertex AND e.dst = c2.vertex)
         INNER JOIN Match m
           ON (m.input = tr.input AND m.vertex = c1.vertex);
-    
+
+
+    -- FIXME: cannot work anymore
     CREATE VIEW view_transitions_as_configuration_pair AS
     SELECT
       c1.rowid AS src_id,
@@ -570,6 +577,11 @@ sub compute_some_transitions {
       idx_tmp_transition
     ON tmp_transition(src, input);
 
+  }, {}, $limit);
+
+  $self->_log->debug('computed wanted set of transitions');
+
+  $dbh->do(q{
     INSERT OR REPLACE INTO
       tmp_transition(src, input, dst_vertex_str)
     SELECT
@@ -592,7 +604,11 @@ sub compute_some_transitions {
     GROUP BY
       n.src,
       n.input;
+  });
 
+  $self->_log->debug('computed new transitions');
+  
+  $dbh->do(q{
     INSERT OR IGNORE INTO State(vertex_str)
     SELECT DISTINCT dst_vertex_str
     FROM tmp_transition;
@@ -625,6 +641,8 @@ sub cleanup_dead_states {
 
   $self->_dbh->begin_work();
 
+  # NOTE: this makes cleanup_dead_states fail when called more
+  # than once. Unsure if that is best.
   $self->_dbh->do(q{
     CREATE TEMPORARY TABLE accepting AS
     SELECT state_id AS state
@@ -655,6 +673,25 @@ sub cleanup_dead_states {
     SET dst = ?
     WHERE dst NOT IN (SELECT state FROM all_living)
   }, {}, $self->dead_state_id);
+
+  # NOTE: overall there is a bug here in that configurations are not
+  # merged when merging
+
+  # TODO: do not repeat CTE
+  $self->_dbh->do(q{
+    WITH RECURSIVE all_living(state) AS (
+      SELECT state FROM accepting
+      
+      UNION
+      
+      SELECT src AS state
+      FROM Transition
+        INNER JOIN all_living
+          ON (Transition.dst = all_living.state)
+    )
+    DELETE FROM State
+    WHERE state_id NOT IN (SELECT state FROM all_living UNION ALL SELECT ?)
+  }, {}, $self->dead_state_id) if 1;
 
   $self->_dbh->do(q{
     DROP TABLE accepting;
