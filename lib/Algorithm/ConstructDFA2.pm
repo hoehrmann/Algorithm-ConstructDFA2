@@ -526,11 +526,16 @@ sub _vertex_str_from_partial_list {
     WHERE root IN (SELECT value FROM json_each(?))
   }, {}, $self->_json->encode(\@vertices));
 
+  # FIXME: this breaks if there are "new" vertices
+  # FIXME: missing group by ^?
+
   return $vertex_str;
 }
 
 sub find_or_create_state_id {
   my ($self, @vertices) = @_;
+
+#  $self->_log->debugf("find_or_create_state_id %s", "@vertices");
 
   my $vertex_str = _vertex_str_from_partial_list($self, @vertices);
 
