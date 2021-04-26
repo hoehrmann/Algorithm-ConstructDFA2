@@ -10,6 +10,7 @@ use Memoize;
 use Log::Any qw//;
 use DBI;
 use JSON;
+#use JSON::PP;
 
 our $VERSION = '0.06';
 
@@ -102,18 +103,21 @@ sub BUILD {
   $self->_log->debug("Register extension functions");
 
   $self->_dbh->sqlite_create_function( '_vertex_matches', 2, sub {
-    return !! $self->vertex_matches->(@_);
+    my $return = !! $self->vertex_matches->(@_);
+    return $return;
   });
 
   $self->_dbh->sqlite_create_function( '_vertex_nullable', 1, sub {
-    return !! $self->vertex_nullable->(@_);
+    my $return = !! $self->vertex_nullable->(@_);
+    return $return;
   });
 
   $self->_dbh->sqlite_create_function( '_canonical', 1, sub {
     # Since SQLite's json_group_array does not guarantee ordering,
     # we sort the items in the list ourselves here.
     my @vertices = $self->_vertex_str_to_vertices(@_);
-    return $self->_vertex_str_from_vertices(@vertices);
+    my $return = $self->_vertex_str_from_vertices(@vertices);
+    return $return;
   });
 
   ###################################################################
@@ -146,7 +150,7 @@ sub BUILD {
   ###################################################################
   # Let DB analyze data so far
 
-  # FIXME: strictly speaking, the dead state is a ombination of all
+  # FIXME: strictly speaking, the dead state is a combination of all
   # vertices from which an accepting combination of vertices cannot
   # be reached. That might be important. Perhaps when later merging
   # dead states, this would be resolved automatically? Probably not.
@@ -160,7 +164,7 @@ sub BUILD {
   # order-of-magnitude performance improvement for some inputs.
 
   $self->_log->debug("Updating DB statistics");
-  $self->_dbh->do('ANALYZE');
+  $self->_dbh->do('ANALYZE', {});
 }
 
 sub _deploy_schema {
@@ -380,21 +384,7 @@ sub _deploy_schema {
         INNER JOIN Match m
           ON (m.input = tr.input AND m.vertex = c1.vertex);
 
-
-    -- FIXME: cannot work anymore
-    CREATE VIEW view_transitions_as_configuration_pair AS
-    SELECT
-      c1.rowid AS src_id,
-      c2.rowid AS dst_id
-    FROM
-      view_transitions_as_5tuples t
-        INNER JOIN Configuration c1
-          ON (c1.state = t.src_state
-            AND c1.vertex = t.src_vertex)
-        INNER JOIN Configuration c2
-          ON (c2.state = t.dst_state
-            AND c2.vertex = t.dst_vertex);
-  });
+  }, {});
 }
 
 sub _insert_or_ignore {
@@ -443,7 +433,7 @@ sub _init_matches {
     WHERE
       _vertex_matches(Vertex.value, Input.value)+0 = 1
     ORDER BY Vertex.value, Input.value
-  });
+  }, {});
 }
 
 sub _init_epsilon_closure {
@@ -467,21 +457,20 @@ sub _init_epsilon_closure {
     )
     SELECT root, v FROM all_e_successors_and_self
     ORDER BY root, v
-  });
+  }, {});
 }
 
 sub _vertex_str_from_vertices {
   my ($self, @vertices) = @_;
 
-  return $self->_json->encode([
-    sort { $a <=> $b } uniq(grep { defined } @vertices)
-  ]);
+  my @sorted = sort { $a <=> $b } uniq(grep { defined } @vertices);
+  return $self->_json->encode([@sorted]);
 }
 
 sub _vertex_str_to_vertices {
   my ($self, $vertex_str) = @_;
 
-  return @{ $self->_json->decode($vertex_str) };
+  return @{ scalar( $self->_json->decode($vertex_str) ) };
 }
 
 sub _find_state_id_by_vertex_str {
@@ -520,22 +509,33 @@ sub _vertex_str_from_partial_list {
 
   return $self->_vertex_str_from_vertices() unless @vertices;
 
-  my ($vertex_str) = $self->_dbh->selectrow_array(qq{
+  my $sth = $self->_dbh->prepare(qq{
     SELECT _canonical(json_group_array(closure.e_reachable))
     FROM Closure
     WHERE root IN (SELECT value FROM json_each(?))
-  }, {}, $self->_json->encode(\@vertices));
+--    GROUP BY NULL
+  });
+  
+  $sth->execute($self->_json->encode(\@vertices));
+
+  my ($vertex_str) = $sth->fetchrow_array();
+
+  if (not defined $vertex_str) {
+    # happens only with select*, not fetch*
+    die "https://github.com/perl5-dbi/dbi/issues/98";
+  }
 
   # FIXME: this breaks if there are "new" vertices
   # FIXME: missing group by ^?
 
   return $vertex_str;
+
 }
 
 sub find_or_create_state_id {
   my ($self, @vertices) = @_;
 
-#  $self->_log->debugf("find_or_create_state_id %s", "@vertices");
+  $self->_log->debugf("find_or_create_state_id %s", "@vertices");
 
   my $vertex_str = _vertex_str_from_partial_list($self, @vertices);
 
@@ -609,7 +609,7 @@ sub compute_some_transitions {
     GROUP BY
       n.src,
       n.input;
-  });
+  }, {});
 
   $self->_log->debug('computed new transitions');
   
@@ -649,11 +649,26 @@ sub cleanup_dead_states {
   # NOTE: this makes cleanup_dead_states fail when called more
   # than once. Unsure if that is best.
   $self->_dbh->do(q{
-    CREATE TEMPORARY TABLE accepting AS
+    CREATE TABLE accepting AS
     SELECT state_id AS state
     FROM State
     WHERE _vertices_accept(vertex_str)+0 = 1
-  });
+  }, {});
+
+  $self->_dbh->do(q{
+    CREATE VIEW all_living AS
+    WITH RECURSIVE step(state) AS (
+      SELECT state FROM accepting
+      
+      UNION
+      
+      SELECT src AS state
+      FROM Transition
+        INNER JOIN step
+          ON (Transition.dst = step.state)
+    )
+    SELECT * FROM step
+  }, {});
 
   my @accepting = map { @$_ } $self->_dbh->selectall_array(q{
     SELECT state FROM accepting
@@ -664,16 +679,6 @@ sub cleanup_dead_states {
   # transitions, which should be fine.
 
   $self->_dbh->do(q{
-    WITH RECURSIVE all_living(state) AS (
-      SELECT state FROM accepting
-      
-      UNION
-      
-      SELECT src AS state
-      FROM Transition
-        INNER JOIN all_living
-          ON (Transition.dst = all_living.state)
-    )
     UPDATE Transition
     SET dst = ?
     WHERE dst NOT IN (SELECT state FROM all_living)
@@ -684,23 +689,17 @@ sub cleanup_dead_states {
 
   # TODO: do not repeat CTE
   $self->_dbh->do(q{
-    WITH RECURSIVE all_living(state) AS (
-      SELECT state FROM accepting
-      
-      UNION
-      
-      SELECT src AS state
-      FROM Transition
-        INNER JOIN all_living
-          ON (Transition.dst = all_living.state)
-    )
     DELETE FROM State
     WHERE state_id NOT IN (SELECT state FROM all_living UNION ALL SELECT ?)
   }, {}, $self->dead_state_id) if 1;
 
   $self->_dbh->do(q{
+    DROP VIEW all_living;
+  }, {});
+
+  $self->_dbh->do(q{
     DROP TABLE accepting;
-  });
+  }, {});
 
   $self->_dbh->commit();
 
