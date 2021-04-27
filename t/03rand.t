@@ -20,8 +20,8 @@ sub get_dfa {
   my ($g, $start, $final, $nullable, $matches) = @_;
 
   my $db_file = ':memory:';
-#  my $db_file = 'DELME.sqlite';
-#  unlink $db_file;
+  #  my $db_file = 'DELME.sqlite';
+  #  unlink $db_file;
 
   my $dfa = Algorithm::ConstructDFA2->new(
     input_alphabet     => [ @alphabet ],

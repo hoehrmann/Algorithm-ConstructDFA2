@@ -196,7 +196,7 @@ sub _deploy_schema {
 
     CREATE TABLE Vertex (
       value INTEGER PRIMARY KEY
-        CHECK(printf("%u", value) = value),
+        CHECK(printf('%u', value) = value),
       is_nullable BOOL
     );
 
@@ -277,6 +277,14 @@ sub _deploy_schema {
       vertex_str TEXT UNIQUE NOT NULL
     );
 
+    CREATE TRIGGER trigger_State_transitions
+    AFTER INSERT ON State
+    BEGIN
+      INSERT INTO Transition(src, input, dst)
+      SELECT NEW.state_id, Input.value, NULL FROM Input
+      ;
+    END;
+
     -----------------------------------------------------------------
     -- DFA State Composition
     -----------------------------------------------------------------
@@ -319,7 +327,7 @@ sub _deploy_schema {
     CREATE TABLE Transition (
       src INTEGER NOT NULL,
       input INTEGER NOT NULL,
-      dst INTEGER NOT NULL,
+      dst INTEGER,
       UNIQUE(src, input),
       FOREIGN KEY (dst)
         REFERENCES State(state_id)
@@ -463,7 +471,7 @@ sub _init_epsilon_closure {
 sub _vertex_str_from_vertices {
   my ($self, @vertices) = @_;
 
-  my @sorted = sort { $a <=> $b } uniq(grep { defined } @vertices);
+  my @sorted = sort { $a <=> $b } (grep { defined } @vertices);
   return $self->_json->encode([@sorted]);
 }
 
@@ -510,7 +518,7 @@ sub _vertex_str_from_partial_list {
   return $self->_vertex_str_from_vertices() unless @vertices;
 
   my $sth = $self->_dbh->prepare(qq{
-    SELECT _canonical(json_group_array(closure.e_reachable))
+    SELECT _canonical(json_group_array(distinct closure.e_reachable))
     FROM Closure
     WHERE root IN (SELECT value FROM json_each(?))
 --    GROUP BY NULL
@@ -559,43 +567,45 @@ sub compute_some_transitions {
   local $dbh->{sqlite_allow_multiple_statements} = 1;
 
   my ($old_max) = $dbh->selectrow_array(q{
-    SELECT COALESCE(MAX(rowid), 0) FROM Transition
+    SELECT COUNT(*) FROM Transition WHERE dst IS NOT NULL
   });
 
   $dbh->do(q{
-    DROP TABLE IF EXISTS tmp_transition;
-    CREATE TABLE tmp_transition AS
+    DROP TABLE IF EXISTS temp.tmp_transition;
+    CREATE TABLE temp.tmp_transition(
+      src INT NOT NULL,
+      input INT NOT NULL,
+      dst_vertex_str TEXT NOT NULL,
+      UNIQUE(src, input)
+    );
+    INSERT INTO
+      temp.tmp_transition
     SELECT
-        s.state_id AS src 
-      , i.value AS input
-      , '[]' AS dst_vertex_str
-    FROM 
-      state s 
-      CROSS JOIN input i
-      LEFT JOIN transition t
-        ON (t.src = s.state_id AND t.input = i.value)
+      src,
+      input,
+      '[]'
+    FROM
+      Transition
     WHERE
-      t.dst IS NULL
-    LIMIT ?;
-
-    CREATE UNIQUE INDEX
-      idx_tmp_transition
-    ON tmp_transition(src, input);
-
+      dst IS NULL
+    LIMIT
+      ?
   }, {}, $limit);
 
-  $self->_log->debug('computed wanted set of transitions');
+  $self->_log->debug('going to compute new transitions...');
 
   $dbh->do(q{
     INSERT OR REPLACE INTO
-      tmp_transition(src, input, dst_vertex_str)
+      temp.tmp_transition(src, input, dst_vertex_str)
     SELECT
       n.src,
       n.input,
-      _canonical(json_group_array(closure.e_reachable))
-        AS dst_vertex_str
+      (((
+        JSON_GROUP_ARRAY(DISTINCT closure.e_reachable)
+          -- FILTER (WHERE closure.e_reachable IS NOT NULL)
+      ))) AS dst_vertex_str
     FROM
-      tmp_transition n
+      temp.tmp_transition n
         INNER JOIN configuration c
           ON (n.src = c.state)
         INNER JOIN edge
@@ -603,35 +613,39 @@ sub compute_some_transitions {
         INNER JOIN closure
           ON (edge.dst = closure.root)
         INNER JOIN match m
-          ON (m.vertex = c.vertex)
-    WHERE
-      m.input = n.input
+          ON (m.vertex = c.vertex AND m.input = n.input)
     GROUP BY
       n.src,
-      n.input;
-  }, {});
+      n.input
+    LIMIT
+      ?
 
-  $self->_log->debug('computed new transitions');
+  }, {}, $limit);
+
+  $self->_log->debug('computed new transitions, inserting them...');
   
   $dbh->do(q{
     INSERT OR IGNORE INTO State(vertex_str)
     SELECT DISTINCT dst_vertex_str
-    FROM tmp_transition;
+    FROM temp.tmp_transition;
 
-    INSERT INTO Transition(src, input, dst)
-    SELECT src, input, s.state_id
-    FROM tmp_transition n
+    UPDATE Transition SET dst = s.state_id
+    FROM temp.tmp_transition n
       INNER JOIN State s
-        ON (s.vertex_str = n.dst_vertex_str);
-
+        ON (s.vertex_str = n.dst_vertex_str)
+    WHERE n.src = Transition.src AND n.input = Transition.input
+    ;
+        
     ANALYZE State;
     ANALYZE Transition;
 
-  }, {}, $limit);
+  }, {});
 
   my ($new_max) = $dbh->selectrow_array(q{
-    SELECT COALESCE(MAX(rowid), 0) FROM Transition
+    SELECT COUNT(*) FROM Transition WHERE dst IS NOT NULL
   });
+
+  $self->_log->debugf('inserted %u new transitions', $new_max - $old_max);
   
   return $new_max - $old_max;
 }
