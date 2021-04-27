@@ -600,7 +600,7 @@ sub compute_some_transitions {
     SELECT
       n.src,
       n.input,
-      (((
+      _canonical(((
         JSON_GROUP_ARRAY(DISTINCT closure.e_reachable)
           -- FILTER (WHERE closure.e_reachable IS NOT NULL)
       ))) AS dst_vertex_str
