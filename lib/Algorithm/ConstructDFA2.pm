@@ -274,7 +274,8 @@ sub _deploy_schema {
 
     CREATE TABLE State (
       state_id INTEGER PRIMARY KEY NOT NULL,
-      vertex_str TEXT UNIQUE NOT NULL
+      vertex_str TEXT UNIQUE NOT NULL,
+      distance INT NOT NULL
     );
 
     CREATE TRIGGER trigger_State_transitions
@@ -352,6 +353,23 @@ sub _deploy_schema {
     -----------------------------------------------------------------
     -- Views
     -----------------------------------------------------------------
+
+    CREATE VIEW view_all_e_successors_and_self AS 
+    WITH RECURSIVE all_e_successors_and_self AS (
+
+      SELECT value AS root, value AS v FROM vertex
+
+      UNION
+
+      SELECT r.root, Edge.dst      
+      FROM Edge
+        INNER JOIN all_e_successors_and_self AS r
+          ON (Edge.src = r.v)
+        INNER JOIN Vertex AS src_vertex
+          ON (Edge.src = src_vertex.value)
+      WHERE src_vertex.is_nullable
+    )
+    SELECT root, v AS e_reachable FROM all_e_successors_and_self;
 
     CREATE VIEW view_transitions_as_5tuples AS 
       ---------------------------------------------------------------
@@ -449,22 +467,8 @@ sub _init_epsilon_closure {
 
   $self->_dbh->do(q{
     INSERT INTO Closure(root, e_reachable)
-    WITH RECURSIVE all_e_successors_and_self(root, v) AS (
-
-      SELECT value AS root, value AS v FROM vertex
-
-      UNION
-
-      SELECT r.root, Edge.dst      
-      FROM Edge
-        INNER JOIN all_e_successors_and_self AS r
-          ON (Edge.src = r.v)
-        INNER JOIN Vertex AS src_vertex
-          ON (Edge.src = src_vertex.value)
-      WHERE src_vertex.is_nullable
-    )
-    SELECT root, v FROM all_e_successors_and_self
-    ORDER BY root, v
+    SELECT root, e_reachable FROM view_all_e_successors_and_self
+    ORDER BY root, e_reachable
   }, {});
 }
 
@@ -501,7 +505,7 @@ sub _find_or_create_state_from_vertex_str {
   $self->_dbh->begin_work();
 
   my $sth = $self->_dbh->prepare(q{
-    INSERT INTO State(vertex_str) VALUES (?)
+    INSERT INTO State(vertex_str, distance) VALUES (?, 1)
   });
 
   $sth->execute($vertex_str);
@@ -571,23 +575,28 @@ sub compute_some_transitions {
   });
 
   $dbh->do(q{
-    DROP TABLE IF EXISTS temp.tmp_transition;
-    CREATE TABLE temp.tmp_transition(
+    DROP TABLE IF EXISTS temp.workspace;
+    CREATE TABLE temp.workspace(
       src INT NOT NULL,
       input INT NOT NULL,
       dst_vertex_str TEXT NOT NULL,
+      distance INT,
       UNIQUE(src, input)
     );
+
     INSERT INTO
-      temp.tmp_transition
+      temp.workspace(src, input, dst_vertex_str)
     SELECT
       src,
       input,
       '[]'
     FROM
       Transition
+        INNER JOIN State ON State.state_id = Transition.src
     WHERE
       dst IS NULL
+    ORDER BY
+      State.distance
     LIMIT
       ?
   }, {}, $limit);
@@ -596,41 +605,44 @@ sub compute_some_transitions {
 
   $dbh->do(q{
     INSERT OR REPLACE INTO
-      temp.tmp_transition(src, input, dst_vertex_str)
+      temp.workspace(src, input, dst_vertex_str, distance)
     SELECT
       n.src,
       n.input,
-      _canonical(((
+      _canonical(
         JSON_GROUP_ARRAY(DISTINCT closure.e_reachable)
-          -- FILTER (WHERE closure.e_reachable IS NOT NULL)
-      ))) AS dst_vertex_str
+      ) AS dst_vertex_str,
+      State.distance + 1
     FROM
-      temp.tmp_transition n
+      temp.workspace n
         INNER JOIN configuration c
           ON (n.src = c.state)
+        INNER JOIN State
+          ON (c.state = State.state_id)
         INNER JOIN edge
           ON (c.vertex = edge.src)
-        INNER JOIN closure
+        -- As of 2021-04-28 using the VIEW is faster than the table
+        INNER JOIN view_all_e_successors_and_self closure
           ON (edge.dst = closure.root)
         INNER JOIN match m
           ON (m.vertex = c.vertex AND m.input = n.input)
     GROUP BY
       n.src,
       n.input
-    LIMIT
-      ?
 
-  }, {}, $limit);
+  }, {});
 
   $self->_log->debug('computed new transitions, inserting them...');
   
   $dbh->do(q{
-    INSERT OR IGNORE INTO State(vertex_str)
-    SELECT DISTINCT dst_vertex_str
-    FROM temp.tmp_transition;
+
+    INSERT OR IGNORE INTO State(vertex_str, distance)
+    SELECT dst_vertex_str, MIN(distance)
+    FROM temp.workspace
+    GROUP BY dst_vertex_str;
 
     UPDATE Transition SET dst = s.state_id
-    FROM temp.tmp_transition n
+    FROM temp.workspace n
       INNER JOIN State s
         ON (s.vertex_str = n.dst_vertex_str)
     WHERE n.src = Transition.src AND n.input = Transition.input
@@ -746,6 +758,9 @@ sub backup_to_file {
 }
 
 # sub backup_to_dbh {
+#
+# TODO: check out new DBD::SQLite method for this.
+#
 #   my ($self, $schema_version) = @_;
 # 
 #   die unless $schema_version eq 'v0';
