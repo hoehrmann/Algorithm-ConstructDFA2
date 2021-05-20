@@ -426,7 +426,22 @@ sub _deploy_schema {
         INNER JOIN Edge e
           ON (e.src = c1.vertex AND e.dst = c2.vertex)
         INNER JOIN Match m
-          ON (m.input = tr.input AND m.vertex = c1.vertex);
+          ON (m.input = tr.input AND m.vertex = c1.vertex)
+    ;
+
+    CREATE VIEW all_living AS
+    WITH RECURSIVE step(state) AS (
+      SELECT state FROM accepting
+      
+      UNION
+      
+      SELECT src AS state
+      FROM Transition
+        INNER JOIN step
+          ON (Transition.dst = step.state)
+    )
+    SELECT * FROM step
+    ;
 
   }, {});
 }
@@ -565,11 +580,13 @@ sub _vertex_str_from_partial_list {
 sub find_or_create_state_id {
   my ($self, @vertices) = @_;
 
-  $self->_log->debugf("find_or_create_state_id %s", "@vertices");
-
   my $vertex_str = _vertex_str_from_partial_list($self, @vertices);
 
-  return _find_or_create_state_from_vertex_str($self, $vertex_str);
+  my $state_id = _find_or_create_state_from_vertex_str($self, $vertex_str);
+
+  $self->_log->debugf("find_or_create_state_id %s -> %u", "@vertices", $state_id);
+
+  return $state_id;
 }
 
 sub vertices_in_state {
@@ -699,6 +716,7 @@ sub cleanup_dead_states {
   my $weak_cb = $vertices_accept;
   weaken $weak_cb;
 
+  # FIXME: https://github.com/DBD-SQLite/DBD-SQLite/issues/77
   $self->_dbh->sqlite_create_function( '_vertices_accept', 1, sub {
     my @vertices = $weak_self->_vertex_str_to_vertices(@_);
     return !! $weak_cb->(@vertices);
@@ -706,28 +724,11 @@ sub cleanup_dead_states {
 
   $self->_dbh->begin_work();
 
-  # NOTE: this makes cleanup_dead_states fail when called more
-  # than once. Unsure if that is best.
   $self->_dbh->do(q{
     CREATE TABLE accepting AS
     SELECT state_id AS state
     FROM State
     WHERE _vertices_accept(vertex_str)+0 = 1
-  }, {});
-
-  $self->_dbh->do(q{
-    CREATE VIEW all_living AS
-    WITH RECURSIVE step(state) AS (
-      SELECT state FROM accepting
-      
-      UNION
-      
-      SELECT src AS state
-      FROM Transition
-        INNER JOIN step
-          ON (Transition.dst = step.state)
-    )
-    SELECT * FROM step
   }, {});
 
   my @accepting = map { @$_ } $self->_dbh->selectall_array(q{
@@ -738,23 +739,31 @@ sub cleanup_dead_states {
   # possible start states, but they would then simply have no
   # transitions, which should be fine.
 
-  my $merged_id = $self->merge_states($self->_dbh->selectall_array(q{
-    SELECT state_id
-    FROM State
-    WHERE state_id NOT IN (SELECT state FROM all_living)
-  }));
+  # FIXME: ^ Umm, but we delete the redundant states later?
 
+  my $merged_id = $self->merge_states(
+    map { @$_ } $self->_dbh->selectall_array(q{
+      SELECT state_id
+      FROM State
+      WHERE state_id NOT IN (SELECT state FROM all_living)
+    })
+  );
+
+  my ($merged_accepts) = $self->_dbh->selectrow_array(q{
+    SELECT
+      _vertices_accept(vertex_str)+0 = 1
+    FROM
+      State
+    WHERE
+      state_id = ? + 0
+  }, {}, $merged_id);
+
+  push @accepting, $merged_id if (
+    $merged_accepts and not grep { $_ == $merged_id } @accepting
+  );
+
+  # FIXME: This logic needs to be in `merge_states`
   $self->_set_dead_state_id($merged_id) if defined $merged_id;
-
-  # # TODO: do not repeat CTE
-  # $self->_dbh->do(q{
-  #   DELETE FROM State
-  #   WHERE state_id NOT IN (SELECT state FROM all_living UNION ALL SELECT ?)
-  # }, {}, $self->dead_state_id) if 1;
-
-  $self->_dbh->do(q{
-    DROP VIEW all_living;
-  }, {});
 
   $self->_dbh->do(q{
     DROP TABLE accepting;
@@ -765,11 +774,17 @@ sub cleanup_dead_states {
   # TODO: is there a better way to drop the function?
   $self->_dbh->sqlite_create_function( '_vertices_accept', 1, undef );
 
+  @accepting = sort { $a <=> $b } @accepting;
+
+  $self->_log->debug("accepting states after cleanup: @accepting");
+
   return @accepting;
 }
 
 sub merge_states {
   my ($self, @states) = @_;
+
+  $self->_log->debug("merge_states(@states)");
 
   return if @states < 2;
 
@@ -787,6 +802,25 @@ sub merge_states {
     map { @$_ } @vertices
   );
 
+  # Copy transition from an old state to the possibly new state.
+  $self->_dbh->do(q{
+
+    UPDATE
+      Transition
+    SET
+      dst = old.dst
+    FROM
+      Transition old
+    WHERE
+      Transition.src = 0 + ? 
+      AND
+      Transition.input = old.input
+      AND
+      old.src = 0 + JSON_EXTRACT(?, '$[0]')
+
+  }, {}, $state_id, $self->_json->encode(\@states));
+
+  # Redirect transitions to one of the merged states to the new one.
   $self->_dbh->do(q{
 
     UPDATE
@@ -795,6 +829,19 @@ sub merge_states {
       dst = 0 + ?
     WHERE
       dst IN (SELECT 0 + value FROM JSON_EACH(?))
+
+  }, {}, $state_id, $self->_json->encode(\@states));
+
+  # Remove merged states.
+  $self->_dbh->do(q{
+
+    DELETE
+    FROM
+      State
+    WHERE
+      state_id <> (? + 0)
+      AND
+      state_id IN (SELECT 0 + value FROM JSON_EACH(?))
 
   }, {}, $state_id, $self->_json->encode(\@states));
 
