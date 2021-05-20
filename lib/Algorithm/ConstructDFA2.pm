@@ -5,6 +5,7 @@ use 5.024000;
 use Types::Standard qw/:all/;
 use List::UtilsBy qw/sort_by nsort_by partition_by/;
 use List::MoreUtils qw/uniq/;
+use Scalar::Util qw/weaken/;
 use Moo;
 use Memoize;
 use Log::Any qw//;
@@ -33,6 +34,7 @@ has 'input_edges' => (
   isa      => ArrayRef[ArrayRef[Int]],
 );
 
+# TODO: allow passing this is ArrayRef[ArrayRef[Int,Int]]
 has 'vertex_matches' => (
   is       => 'ro',
   required => 1,
@@ -102,21 +104,24 @@ sub BUILD {
 
   $self->_log->debug("Register extension functions");
 
+  my $weak_self = $self;
+  weaken $weak_self;
+
   $self->_dbh->sqlite_create_function( '_vertex_matches', 2, sub {
-    my $return = !! $self->vertex_matches->(@_);
+    my $return = !! $weak_self->vertex_matches->(@_);
     return $return;
   });
 
   $self->_dbh->sqlite_create_function( '_vertex_nullable', 1, sub {
-    my $return = !! $self->vertex_nullable->(@_);
+    my $return = !! $weak_self->vertex_nullable->(@_);
     return $return;
   });
 
   $self->_dbh->sqlite_create_function( '_canonical', 1, sub {
     # Since SQLite's json_group_array does not guarantee ordering,
     # we sort the items in the list ourselves here.
-    my @vertices = $self->_vertex_str_to_vertices(@_);
-    my $return = $self->_vertex_str_from_vertices(@vertices);
+    my @vertices = $weak_self->_vertex_str_to_vertices(@_);
+    my $return = $weak_self->_vertex_str_from_vertices(@vertices);
     return $return;
   });
 
@@ -178,9 +183,9 @@ sub _deploy_schema {
     -----------------------------------------------------------------
 
     PRAGMA foreign_keys = ON;
-    PRAGMA synchronous = OFF;
-    PRAGMA journal_mode = OFF;
-    PRAGMA locking_mode = EXCLUSIVE;
+    -- PRAGMA synchronous = OFF;
+    -- PRAGMA journal_mode = OFF;
+    -- PRAGMA locking_mode = EXCLUSIVE;
     
     -----------------------------------------------------------------
     -- Input Alphabet
@@ -284,11 +289,24 @@ sub _deploy_schema {
       INSERT INTO Transition(src, input, dst)
       SELECT NEW.state_id, Input.value, NULL FROM Input
       ;
+      -- INSERT INTO Configuration(state, vertex)
+      -- SELECT NEW.state_id, each.value
+      -- FROM JSON_EACH(NEW.vertex_str) each
+      -- WHERE each.value IS NOT NULL
+      -- ;
     END;
 
     -----------------------------------------------------------------
     -- DFA State Composition
     -----------------------------------------------------------------
+
+    -- CREATE TABLE Configuration (
+    --   state INT REFERENCES State(state_id) ON DELETE CASCADE,
+    --   vertex INT REFERENCES Vertex(value) ON DELETE CASCADE,
+    --   UNIQUE(state, vertex)
+    -- );
+
+    -- There seems to be no benefit in having this ^ as a table.
 
     CREATE VIEW Configuration AS
     SELECT
@@ -599,6 +617,11 @@ sub compute_some_transitions {
       State.distance
     LIMIT
       ?
+    ;
+
+    ANALYZE temp.workspace
+    ;
+
   }, {}, $limit);
 
   $self->_log->debug('going to compute new transitions...');
@@ -609,28 +632,33 @@ sub compute_some_transitions {
     SELECT
       n.src,
       n.input,
-      _canonical(
-        JSON_GROUP_ARRAY(DISTINCT closure.e_reachable)
-      ) AS dst_vertex_str,
+      JSON_GROUP_ARRAY(DISTINCT closure.e_reachable)
+        AS dst_vertex_str,
       State.distance + 1
     FROM
       temp.workspace n
         INNER JOIN configuration c
           ON (n.src = c.state)
+        INNER JOIN match m
+          ON (m.vertex = c.vertex AND m.input = n.input)
         INNER JOIN State
           ON (c.state = State.state_id)
         INNER JOIN edge
           ON (c.vertex = edge.src)
-        -- As of 2021-04-28 using the VIEW is faster than the table
-        INNER JOIN view_all_e_successors_and_self closure
+        INNER JOIN closure
           ON (edge.dst = closure.root)
-        INNER JOIN match m
-          ON (m.vertex = c.vertex AND m.input = n.input)
     GROUP BY
       n.src,
       n.input
 
   }, {});
+
+  $dbh->do(q{
+    UPDATE
+      temp.workspace
+    SET
+      dst_vertex_str = _canonical(dst_vertex_str)
+  });
 
   $self->_log->debug('computed new transitions, inserting them...');
   
@@ -665,9 +693,15 @@ sub compute_some_transitions {
 sub cleanup_dead_states {
   my ($self, $vertices_accept) = @_;
 
+  my $weak_self = $self;
+  weaken $weak_self;
+
+  my $weak_cb = $vertices_accept;
+  weaken $weak_cb;
+
   $self->_dbh->sqlite_create_function( '_vertices_accept', 1, sub {
-    my @vertices = $self->_vertex_str_to_vertices(@_);
-    return !! $vertices_accept->(@vertices);
+    my @vertices = $weak_self->_vertex_str_to_vertices(@_);
+    return !! $weak_cb->(@vertices);
   });
 
   $self->_dbh->begin_work();
@@ -704,20 +738,19 @@ sub cleanup_dead_states {
   # possible start states, but they would then simply have no
   # transitions, which should be fine.
 
-  $self->_dbh->do(q{
-    UPDATE Transition
-    SET dst = ?
-    WHERE dst NOT IN (SELECT state FROM all_living)
-  }, {}, $self->dead_state_id);
+  my $merged_id = $self->merge_states($self->_dbh->selectall_array(q{
+    SELECT state_id
+    FROM State
+    WHERE state_id NOT IN (SELECT state FROM all_living)
+  }));
 
-  # NOTE: overall there is a bug here in that configurations are not
-  # merged when merging
+  $self->_set_dead_state_id($merged_id) if defined $merged_id;
 
-  # TODO: do not repeat CTE
-  $self->_dbh->do(q{
-    DELETE FROM State
-    WHERE state_id NOT IN (SELECT state FROM all_living UNION ALL SELECT ?)
-  }, {}, $self->dead_state_id) if 1;
+  # # TODO: do not repeat CTE
+  # $self->_dbh->do(q{
+  #   DELETE FROM State
+  #   WHERE state_id NOT IN (SELECT state FROM all_living UNION ALL SELECT ?)
+  # }, {}, $self->dead_state_id) if 1;
 
   $self->_dbh->do(q{
     DROP VIEW all_living;
@@ -733,6 +766,40 @@ sub cleanup_dead_states {
   $self->_dbh->sqlite_create_function( '_vertices_accept', 1, undef );
 
   return @accepting;
+}
+
+sub merge_states {
+  my ($self, @states) = @_;
+
+  return if @states < 2;
+
+  my @vertices = $self->_dbh->selectall_array(q{
+
+    SELECT DISTINCT
+      vertex
+    FROM
+      JSON_EACH(?) each
+        INNER JOIN Configuration c ON (0 + each.value = c.state)
+
+  }, {}, $self->_json->encode(\@states));
+
+  my $state_id = $self->find_or_create_state_id(
+    map { @$_ } @vertices
+  );
+
+  $self->_dbh->do(q{
+
+    UPDATE
+      Transition
+    SET
+      dst = 0 + ?
+    WHERE
+      dst IN (SELECT 0 + value FROM JSON_EACH(?))
+
+  }, {}, $state_id, $self->_json->encode(\@states));
+
+  return $state_id;
+
 }
 
 sub transitions_as_3tuples {
@@ -912,6 +979,10 @@ transitions to different dead states.
 If, for example, the input NFA has a special "final" vertex that
 indicates acceptance when reached, the code reference would check
 if the vertex list contains this vertex.
+
+=item $dfa->merge_states(@state_ids)
+
+...
 
 =item $dfa->transitions_as_3tuples()
 
