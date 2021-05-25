@@ -294,9 +294,12 @@ for ( 1 .. 100 ) {
   my ($dfa, $start_id) = get_dfa($g, $start, $final,
     \%nullable, \%matches);
 
-  my @accepting = $dfa->cleanup_dead_states(sub {
-    scalar grep { $_ eq $final } @_;
-  });
+  my $iter = $dfa->state_vertices_iterator();
+
+  my @accepting;
+  while (my ($state, $vertices) = $iter->()) {
+    push @accepting, $state if scalar grep { $_ eq $final } @$vertices
+  }
 
   my %accepting_id = map { $_ => 1 } @accepting;
 

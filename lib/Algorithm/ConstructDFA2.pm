@@ -555,10 +555,14 @@ sub _vertex_str_from_partial_list {
   return $self->_vertex_str_from_vertices() unless @vertices;
 
   my $sth = $self->_dbh->prepare(qq{
-    SELECT _canonical(json_group_array(distinct closure.e_reachable))
-    FROM Closure
-    WHERE root IN (SELECT value FROM json_each(?))
---    GROUP BY NULL
+    SELECT
+      _canonical(JSON_GROUP_ARRAY(DISTINCT closure.e_reachable))
+    FROM
+      Closure
+    WHERE
+      root IN (SELECT value FROM json_each(?))
+    GROUP BY
+      NULL
   });
   
   $sth->execute($self->_json->encode(\@vertices));
@@ -568,6 +572,8 @@ sub _vertex_str_from_partial_list {
   if (not defined $vertex_str) {
     # happens only with select*, not fetch*
     die "https://github.com/perl5-dbi/dbi/issues/98";
+
+    # FIXME: also happens when vertex not known
   }
 
   # FIXME: this breaks if there are "new" vertices
@@ -609,6 +615,8 @@ sub compute_some_transitions {
     SELECT COUNT(*) FROM Transition WHERE dst IS NOT NULL
   });
 
+  $dbh->do('SAVEPOINT compute_some_transitions');
+
   $dbh->do(q{
     DROP TABLE IF EXISTS temp.workspace;
     CREATE TABLE temp.workspace(
@@ -642,6 +650,8 @@ sub compute_some_transitions {
   }, {}, $limit);
 
   $self->_log->debug('going to compute new transitions...');
+
+  # TODO: Maybe not change the table the query is reading from?
 
   $dbh->do(q{
     INSERT OR REPLACE INTO
@@ -703,149 +713,41 @@ sub compute_some_transitions {
   });
 
   $self->_log->debugf('inserted %u new transitions', $new_max - $old_max);
-  
+
+  $dbh->do('RELEASE compute_some_transitions');
+
   return $new_max - $old_max;
 }
 
-sub cleanup_dead_states {
-  my ($self, $vertices_accept) = @_;
+sub state_vertices_iterator {
+
+  my ($self) = @_;
+
+  my ($state) = $self->_dbh->selectrow_array(q{
+    SELECT MIN(state_id) FROM state
+  });
 
   my $weak_self = $self;
   weaken $weak_self;
 
-  my $weak_cb = $vertices_accept;
-  weaken $weak_cb;
+  return sub {
 
-  # FIXME: https://github.com/DBD-SQLite/DBD-SQLite/issues/77
-  $self->_dbh->sqlite_create_function( '_vertices_accept', 1, sub {
-    my @vertices = $weak_self->_vertex_str_to_vertices(@_);
-    return !! $weak_cb->(@vertices);
-  });
+    return unless defined $state;
 
-  $self->_dbh->begin_work();
+    my @return = (
+      $state,
+      $weak_self->_json->decode($weak_self->_dbh->selectrow_array(q{
+        SELECT vertex_str FROM state WHERE state_id = 0 + ?
+      }, {}, $state))
+    );
 
-  $self->_dbh->do(q{
-    CREATE TABLE accepting AS
-    SELECT state_id AS state
-    FROM State
-    WHERE _vertices_accept(vertex_str)+0 = 1
-  }, {});
+    ($state) = $weak_self->_dbh->selectrow_array(q{
+      SELECT MIN(state_id) FROM state WHERE state_id > 0 + ?
+    }, {}, $state);
 
-  my @accepting = map { @$_ } $self->_dbh->selectall_array(q{
-    SELECT state FROM accepting
-  });
+    return @return;
 
-  # NOTE: this also renames states in transitions involving
-  # possible start states, but they would then simply have no
-  # transitions, which should be fine.
-
-  # FIXME: ^ Umm, but we delete the redundant states later?
-
-  my $merged_id = $self->merge_states(
-    map { @$_ } $self->_dbh->selectall_array(q{
-      SELECT state_id
-      FROM State
-      WHERE state_id NOT IN (SELECT state FROM all_living)
-    })
-  );
-
-  my ($merged_accepts) = $self->_dbh->selectrow_array(q{
-    SELECT
-      _vertices_accept(vertex_str)+0 = 1
-    FROM
-      State
-    WHERE
-      state_id = ? + 0
-  }, {}, $merged_id);
-
-  push @accepting, $merged_id if (
-    $merged_accepts and not grep { $_ == $merged_id } @accepting
-  );
-
-  # FIXME: This logic needs to be in `merge_states`
-  $self->_set_dead_state_id($merged_id) if defined $merged_id;
-
-  $self->_dbh->do(q{
-    DROP TABLE accepting;
-  }, {});
-
-  $self->_dbh->commit();
-
-  # TODO: is there a better way to drop the function?
-  $self->_dbh->sqlite_create_function( '_vertices_accept', 1, undef );
-
-  @accepting = sort { $a <=> $b } @accepting;
-
-  $self->_log->debug("accepting states after cleanup: @accepting");
-
-  return @accepting;
-}
-
-sub merge_states {
-  my ($self, @states) = @_;
-
-  $self->_log->debug("merge_states(@states)");
-
-  return if @states < 2;
-
-  my @vertices = $self->_dbh->selectall_array(q{
-
-    SELECT DISTINCT
-      vertex
-    FROM
-      JSON_EACH(?) each
-        INNER JOIN Configuration c ON (0 + each.value = c.state)
-
-  }, {}, $self->_json->encode(\@states));
-
-  my $state_id = $self->find_or_create_state_id(
-    map { @$_ } @vertices
-  );
-
-  # Copy transition from an old state to the possibly new state.
-  $self->_dbh->do(q{
-
-    UPDATE
-      Transition
-    SET
-      dst = old.dst
-    FROM
-      Transition old
-    WHERE
-      Transition.src = 0 + ? 
-      AND
-      Transition.input = old.input
-      AND
-      old.src = 0 + JSON_EXTRACT(?, '$[0]')
-
-  }, {}, $state_id, $self->_json->encode(\@states));
-
-  # Redirect transitions to one of the merged states to the new one.
-  $self->_dbh->do(q{
-
-    UPDATE
-      Transition
-    SET
-      dst = 0 + ?
-    WHERE
-      dst IN (SELECT 0 + value FROM JSON_EACH(?))
-
-  }, {}, $state_id, $self->_json->encode(\@states));
-
-  # Remove merged states.
-  $self->_dbh->do(q{
-
-    DELETE
-    FROM
-      State
-    WHERE
-      state_id <> (? + 0)
-      AND
-      state_id IN (SELECT 0 + value FROM JSON_EACH(?))
-
-  }, {}, $state_id, $self->_json->encode(\@states));
-
-  return $state_id;
+  };
 
 }
 
@@ -925,9 +827,13 @@ Algorithm::ConstructDFA2 - Deterministic finite automaton construction
     ...
   }
 
-  my @accepting = $dfa->cleanup_dead_states(sub(@vertices) {
-    ...
-  });
+  my $iter = $dfa->state_vertices_iterator();
+  
+  my @accepting;
+
+  while (my ($state, $vertices) = $iter->()) {
+    push @accepting, $state if accepts($vertices);
+  }
 
 =head1 DESCRIPTION
 
@@ -1016,20 +922,11 @@ indicates that all transitions have been computed.
 Returns the state identifier for a fixed dead state (from which
 no accepting configuration can be reached).
 
-=item $dfa->cleanup_dead_states(\&vertices_accept)
+=item $dfa->state_vertices_iterator()
 
-Given a code reference that takes a list of vertices and returns
-true if and only if the vertices are an accepting configuration,
-this method changes the automaton so that dead states have no
-transitions to different dead states.
-
-If, for example, the input NFA has a special "final" vertex that
-indicates acceptance when reached, the code reference would check
-if the vertex list contains this vertex.
-
-=item $dfa->merge_states(@state_ids)
-
-...
+Returns a code reference that returns the id of the next state and
+an array reference of all the vertices in that state, or nothing if
+there are no more states.
 
 =item $dfa->transitions_as_3tuples()
 
